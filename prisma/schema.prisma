@@ -5,14 +5,12 @@ generator client {
   provider = "prisma-client-js"
 }
 
-// Note that some adapters may set a maximum length for the String type by default, please ensure your strings are long
-// enough when changing adapters.
-// See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
 
+// Session storage for Shopify authentication - migrated from SQLite
 model Session {
   id            String    @id
   shop          String
@@ -29,4 +27,229 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+}
+
+// Shopify shops for multi-tenant support
+model ShopifyShop {
+  id          String   @id @default(uuid()) @db.Uuid
+  shopDomain  String   @unique
+  accessToken String?
+  scopes      String?
+  country     String?
+  currency    String?
+  timezone    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  // Relationships
+  campaigns          Campaign[]
+  pricingJobs        PricingJob[]
+  auditTrailEntries  AuditTrailEntry[]
+  webhookLogs        WebhookLog[]
+  
+  @@map("shopify_shops")
+}
+
+// Campaign management for automated pricing rules
+model Campaign {
+  id               String             @id @default(uuid()) @db.Uuid
+  name             String
+  description      String?
+  status           CampaignStatus     @default(DRAFT)
+  targetProducts   Json               // Array of product/variant targeting criteria
+  priority         Int                @default(1)
+  triggerCount     Int                @default(0)
+  lastTriggered    DateTime?
+  userId           String?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+  
+  // Relationships
+  shopifyShopId    String             @db.Uuid
+  shopifyShop      ShopifyShop        @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+  rules            PricingRule[]
+  
+  @@index([shopifyShopId, status])
+  @@index([shopifyShopId, lastTriggered])
+  @@map("campaigns")
+}
+
+// Pricing rules for both campaigns and manual jobs
+model PricingRule {
+  id              String    @id @default(uuid()) @db.Uuid
+  description     String?
+  whenCondition   String    // e.g., "inventory_level", "compare_at_price"
+  whenOperator    String    // e.g., "less_than", "greater_than", "equals"
+  whenValue       String    // String to handle various data types
+  thenAction      String    // e.g., "set_price", "adjust_price"
+  thenMode        String    // e.g., "fixed", "percentage"
+  thenValue       String    // String to handle various data types
+  changeCompareAt Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  // Relationships - can belong to either campaign OR pricing job
+  campaignId      String?   @db.Uuid
+  campaign        Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  pricingJobId    String?   @db.Uuid
+  pricingJob      PricingJob? @relation(fields: [pricingJobId], references: [id], onDelete: Cascade)
+  
+  @@index([campaignId])
+  @@index([pricingJobId])
+  @@map("pricing_rules")
+}
+
+// Manual pricing jobs
+model PricingJob {
+  id            String           @id @default(uuid()) @db.Uuid
+  name          String
+  type          PricingJobType   @default(MANUAL)
+  status        JobStatus        @default(PENDING)
+  totalVariants Int              @default(0)
+  processedCount Int             @default(0)
+  successCount  Int              @default(0)
+  errorCount    Int              @default(0)
+  startedAt     DateTime?
+  completedAt   DateTime?
+  userId        String?
+  exportPath    String?          // Path to export file
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  
+  // Relationships
+  shopifyShopId     String             @db.Uuid
+  shopifyShop       ShopifyShop        @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+  rules             PricingRule[]
+  selectedVariants  SelectedVariant[]
+  processingResults ProcessingResult[]
+  
+  @@index([shopifyShopId, status])
+  @@index([shopifyShopId, createdAt])
+  @@map("pricing_jobs")
+}
+
+// Selected variants for pricing jobs
+model SelectedVariant {
+  id           String   @id @default(uuid()) @db.Uuid
+  variantId    String
+  productId    String
+  productTitle String?
+  variantTitle String?
+  currentPrice String?
+  compareAtPrice String?
+  inventory    Int?
+  createdAt    DateTime @default(now())
+  
+  // Relationships
+  pricingJobId String     @db.Uuid
+  pricingJob   PricingJob @relation(fields: [pricingJobId], references: [id], onDelete: Cascade)
+  
+  @@index([pricingJobId])
+  @@index([variantId])
+  @@map("selected_variants")
+}
+
+// Processing results with audit trail references
+model ProcessingResult {
+  id             String   @id @default(uuid()) @db.Uuid
+  variantId      String
+  productId      String
+  success        Boolean
+  oldPrice       String?
+  newPrice       String?
+  oldCompareAt   String?
+  newCompareAt   String?
+  errorMessage   String?
+  processedAt    DateTime @default(now())
+  
+  // Relationships
+  pricingJobId    String           @db.Uuid
+  pricingJob      PricingJob       @relation(fields: [pricingJobId], references: [id], onDelete: Cascade)
+  auditTrailId    String?          @db.Uuid
+  auditTrailEntry AuditTrailEntry? @relation(fields: [auditTrailId], references: [id])
+  
+  @@index([pricingJobId])
+  @@index([variantId])
+  @@index([auditTrailId])
+  @@map("processing_results")
+}
+
+// Core audit trail for compliance and tracking
+model AuditTrailEntry {
+  id             String    @id @default(uuid()) @db.Uuid
+  entityType     String    // 'variant', 'product', 'campaign'
+  entityId       String    // Shopify ID of the entity
+  changeType     String    // 'price_update', 'compare_at_update', 'inventory_sync', 'campaign_triggered'
+  oldValue       String?   // Previous value (JSON string)
+  newValue       String?   // New value (JSON string)
+  triggerReason  String    // 'manual_job', 'campaign_rule', 'webhook_sync'
+  userId         String?   // User who initiated the change
+  campaignId     String?   // If triggered by campaign
+  pricingJobId   String?   // If part of pricing job
+  metadata       Json?     // Additional context data
+  timestamp      DateTime  @default(now())
+  
+  // Relationships
+  shopifyShopId     String             @db.Uuid
+  shopifyShop       ShopifyShop        @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+  processingResults ProcessingResult[]
+  
+  @@index([shopifyShopId, timestamp])
+  @@index([entityType, entityId])
+  @@index([changeType, timestamp])
+  @@index([campaignId])
+  @@index([pricingJobId])
+  @@map("audit_trail_entries")
+}
+
+// Webhook reliability tracking
+model WebhookLog {
+  id          String           @id @default(uuid()) @db.Uuid
+  webhookType String           // 'inventory_levels/update', 'products/update', etc.
+  shopifyId   String           // Shopify entity ID
+  payload     Json             // Raw webhook payload
+  status      WebhookStatus    @default(RECEIVED)
+  processedAt DateTime?
+  errorMessage String?
+  retryCount  Int              @default(0)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  
+  // Relationships
+  shopifyShopId String      @db.Uuid
+  shopifyShop   ShopifyShop @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+  
+  @@index([shopifyShopId, webhookType])
+  @@index([status, createdAt])
+  @@map("webhook_logs")
+}
+
+// Enums
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  COMPLETED
+  ARCHIVED
+}
+
+enum PricingJobType {
+  MANUAL
+  CAMPAIGN
+  WEBHOOK_SYNC
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  RETRYING
 }

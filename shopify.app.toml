@@ -2,12 +2,13 @@
 
 client_id = "4dca9babd033b9aeb856acaa17935bd1"
 name = "rebly-smartprice"
-application_url = "https://example.com/"
+application_url = "https://smallest-viewing-commitment-bronze.trycloudflare.com"
 embedded = true
 handle = "rebly-smartprice"
 
 [build]
 include_config_on_deploy = true
+automatically_update_urls_on_dev = true
 
 [webhooks]
 api_version = "2025-07"
@@ -25,7 +26,7 @@ api_version = "2025-07"
 scopes = "write_products"
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = ["https://smallest-viewing-commitment-bronze.trycloudflare.com/auth/callback", "https://smallest-viewing-commitment-bronze.trycloudflare.com/auth/shopify/callback", "https://smallest-viewing-commitment-bronze.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false
