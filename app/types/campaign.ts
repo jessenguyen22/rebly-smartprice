@@ -50,6 +50,11 @@ export interface TargetProductCriteria {
     priceRange?: { min?: number; max?: number };
     tags?: string[];
   };
+  _metadata?: {
+    titles?: string[];
+    images?: string[];
+    [key: string]: any;
+  };
 }
 
 export interface CreatePricingRuleData {

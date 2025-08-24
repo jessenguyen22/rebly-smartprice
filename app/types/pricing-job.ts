@@ -52,6 +52,7 @@ export interface ProcessingResult {
 export interface CreatePricingJobData {
   name: string;
   type?: PricingJobType;
+  templateId?: string; // New: Optional template ID reference
   selectedVariants: CreateSelectedVariantData[];
   rules?: CreatePricingRuleData[];
 }

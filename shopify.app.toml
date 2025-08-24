@@ -2,7 +2,7 @@
 
 client_id = "4dca9babd033b9aeb856acaa17935bd1"
 name = "rebly-smartprice"
-application_url = "https://smallest-viewing-commitment-bronze.trycloudflare.com"
+application_url = "https://day-para-condition-eq.trycloudflare.com"
 embedded = true
 handle = "rebly-smartprice"
 
@@ -13,20 +13,31 @@ automatically_update_urls_on_dev = true
 [webhooks]
 api_version = "2025-07"
 
+  # Google Pub/Sub webhook subscriptions for inventory changes
+  [[webhooks.subscriptions]]
+  topics = [ "inventory_levels/update", "inventory_items/update" ]
+  uri = "pubsub://rebly-smart-pricing:shopify-webhooks"
+
+  # Google Pub/Sub webhook subscriptions for product changes  
+  [[webhooks.subscriptions]]
+  topics = [ "products/update", "products/create" ]
+  uri = "pubsub://rebly-smart-pricing:shopify-webhooks"
+
+  # Keep existing HTTP webhooks for app lifecycle - CONVERTED TO PUB/SUB
   [[webhooks.subscriptions]]
   topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
+  uri = "pubsub://rebly-smart-pricing:shopify-webhooks"
 
   [[webhooks.subscriptions]]
   topics = [ "app/scopes_update" ]
-  uri = "/webhooks/app/scopes_update"
+  uri = "pubsub://rebly-smart-pricing:shopify-webhooks"
 
 [access_scopes]
 # Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
-scopes = "write_products"
+scopes = "write_products,read_products,read_inventory,write_inventory"
 
 [auth]
-redirect_urls = ["https://smallest-viewing-commitment-bronze.trycloudflare.com/auth/callback", "https://smallest-viewing-commitment-bronze.trycloudflare.com/auth/shopify/callback", "https://smallest-viewing-commitment-bronze.trycloudflare.com/api/auth/callback"]
+redirect_urls = ["https://day-para-condition-eq.trycloudflare.com/auth/callback", "https://day-para-condition-eq.trycloudflare.com/auth/shopify/callback", "https://day-para-condition-eq.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false

@@ -8,6 +8,9 @@ import {
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 
+// Initialize Pub/Sub webhook listener
+import "./pubsub-listener.server";
+
 export const streamTimeout = 5000;
 
 export default async function handleRequest(

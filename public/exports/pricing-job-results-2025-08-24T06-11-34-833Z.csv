@@ -1,0 +1,20 @@
+# Pricing Job Results Export - Test Export
+# Generated on 2025-08-24T06:11:34.833Z
+
+Product Title,Variant Title,Variant ID,Status,Old Price,New Price,Inventory,Reason/Error
+"The Complete Snowboard","Ice",gid://shopify/ProductVariant/53526747513000,Updated,761.77,771.77,10,"Low inventory (10 < 20)"
+"The Complete Snowboard","Dawn",gid://shopify/ProductVariant/53526747545768,Updated,623.03,633.03,10,"Low inventory (10 < 20)"
+"The Complete Snowboard","Powder",gid://shopify/ProductVariant/53526747611304,Updated,607.78,617.78,10,"Low inventory (10 < 20)"
+"The Complete Snowboard","Electric",gid://shopify/ProductVariant/53526747676840,Updated,607.78,617.78,10,"Low inventory (10 < 20)"
+"The Complete Snowboard","Sunset",gid://shopify/ProductVariant/53526747742376,Updated,607.78,617.78,10,"Low inventory (10 < 20)"
+
+=== JOB SUMMARY ===
+Job Name,"Test Export"
+Action Type,inventory_rules
+Shop Domain,rebly-io-2.myshopify.com
+Created At,2025-08-24T06:11:34.524Z
+Total Processed,5
+Success Count,5
+Failure Count,0
+Skipped Count,0
+Success Rate,100%

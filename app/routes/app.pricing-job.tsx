@@ -16,25 +16,80 @@ import {
   Select,
   TextField,
   Checkbox,
+  Toast,
 } from "@shopify/polaris";
 import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
 import { CampaignRepository } from "../models/campaign.server";
 import { PricingJobRepository } from "../models/pricing-job.server";
 import { AuditLogger } from "../services/audit-logger.server";
+import { GraphQLOptimizationService } from "../services/graphql-optimization.server";
+import { ErrorHandlingService, ErrorType } from "../services/error-handling.server";
+import { 
+  getPricingJobTemplates, 
+  createPricingJobTemplate, 
+  getPricingJobTemplate,
+  type PricingJobTemplate, 
+  type PricingRule as TemplatePricingRule 
+} from "../models/pricing-job-template.server";
+import { EnhancedResultsTable } from "../components/pricing-job/EnhancedResultsTable";
+import type { ExportResult } from "../components/pricing-job/EnhancedResultsTable";
+import { CampaignIntegrationHint } from "../components/pricing-job/CampaignIntegrationHint";
+import { TemplateSelector } from "../components/pricing-job/TemplateSelector";
+import { initializeCampaignProcessing } from "../services/campaign-session-integration.server";
 import { json } from "@remix-run/node";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
-  const campaignRepo = new CampaignRepository(session.shop);
+export const loader = async (args: LoaderFunctionArgs) => {
+  // Initialize campaign processing with admin client registration
+  const { session, admin } = await initializeCampaignProcessing.initializeCampaignProcessingFromLoader(args);
+  const errorHandler = ErrorHandlingService.getInstance();
   
-  // Get active campaigns for this shop
-  const activeCampaigns = await campaignRepo.findByStatus('ACTIVE');
-  
-  return json({ 
-    shop: session.shop,
-    activeCampaigns 
-  });
+  try {
+    const campaignRepo = new CampaignRepository(session.shop);
+    const pricingJobRepo = new PricingJobRepository(session.shop);
+    
+    // Parallel data loading with performance optimization
+    const [activeCampaigns, templates, performanceMetrics, recentJobs] = await Promise.all([
+      campaignRepo.findByStatus('ACTIVE').catch(error => {
+        errorHandler.handleDatabaseError(error, 'load_campaigns', { shop: session.shop });
+        return [];
+      }),
+      getPricingJobTemplates(session.shop).catch(error => {
+        errorHandler.handleTemplateError(error, 'load_templates', { shop: session.shop });
+        return [];
+      }),
+      pricingJobRepo.getShopPerformanceSummary(7).catch(error => {
+        errorHandler.handleDatabaseError(error, 'load_performance_metrics', { shop: session.shop });
+        return null;
+      }),
+      pricingJobRepo.findRecentJobs(5).catch(error => {
+        errorHandler.handleDatabaseError(error, 'load_recent_jobs', { shop: session.shop });
+        return [];
+      })
+    ]);
+    
+    return json({ 
+      shop: session.shop,
+      activeCampaigns,
+      templates,
+      performanceMetrics,
+      recentJobs,
+      errorStatistics: errorHandler.getErrorStatistics(1) // Last 1 hour
+    });
+  } catch (error) {
+    const errorDetails = errorHandler.handleDatabaseError(error, 'loader', { shop: session.shop });
+    
+    // Return minimal data on error
+    return json({ 
+      shop: session.shop,
+      activeCampaigns: [],
+      templates: [],
+      performanceMetrics: null,
+      recentJobs: [],
+      errorStatistics: errorHandler.getErrorStatistics(1),
+      loaderError: errorDetails
+    });
+  }
 };
 
 const processInventoryRules = async (
@@ -383,12 +438,95 @@ const processInventoryRules = async (
   }
 };
 
-export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+export const action = async (args: ActionFunctionArgs) => {
+  // Initialize campaign processing with admin client registration
+  const { admin, session } = await initializeCampaignProcessing.initializeCampaignProcessingFromAction(args);
+  const errorHandler = ErrorHandlingService.getInstance();
+  const graphqlOptimizer = new GraphQLOptimizationService(admin.graphql);
   
-  const formData = await request.formData();
-  const variantIds = formData.getAll("variantIds[]") as string[];
+  const formData = await args.request.formData();
   const actionType = formData.get("action") as string;
+  
+  try {
+    // Handle template operations
+    if (actionType === "save_template") {
+    const templateName = formData.get("templateName") as string;
+    const templateDescription = formData.get("templateDescription") as string;
+    const rulesJson = formData.get("rules") as string;
+    const bulkAmount = formData.get("bulkAmount") as string;
+    const bulkType = formData.get("bulkType") as string;
+    
+    if (!templateName?.trim()) {
+      return json({
+        success: false,
+        error: "Template name is required",
+      }, { status: 400 });
+    }
+    
+    try {
+      let rules: TemplatePricingRule[] | undefined;
+      if (rulesJson) {
+        rules = JSON.parse(rulesJson);
+      }
+      
+      const template = await createPricingJobTemplate({
+        name: templateName.trim(),
+        description: templateDescription?.trim() || undefined,
+        rules,
+        bulkAmount: bulkAmount || undefined,
+        bulkType: (bulkType as 'increase' | 'decrease') || undefined,
+        userId: undefined, // For shop-wide templates
+        shopDomain: session.shop,
+      });
+      
+      return json({
+        success: true,
+        template,
+      });
+    } catch (error) {
+      console.error("Error saving template:", error);
+      return json({
+        success: false,
+        error: "Failed to save template",
+      }, { status: 500 });
+    }
+  }
+  
+  // Handle template loading
+  if (actionType === "load_template") {
+    const templateId = formData.get("templateId") as string;
+    
+    if (!templateId) {
+      return json({
+        success: false,
+        error: "Template ID is required",
+      }, { status: 400 });
+    }
+    
+    try {
+      const template = await getPricingJobTemplate(templateId, session.shop);
+      
+      if (!template) {
+        return json({
+          success: false,
+          error: "Template not found",
+        }, { status: 404 });
+      }
+      
+      return json({
+        success: true,
+        template,
+      });
+    } catch (error) {
+      console.error("Error loading template:", error);
+      return json({
+        success: false,
+        error: "Failed to load template",
+      }, { status: 500 });
+    }
+  }
+  
+  const variantIds = formData.getAll("variantIds[]") as string[];
   const jobName = formData.get("jobName") as string || 'Bulk Pricing Job';
   const pricingRuleJson = formData.get("pricingRule") as string;
   
@@ -624,6 +762,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       results,
     };
   }
+} catch (actionError) {
+  // Global action error handler
+  const errorDetails = errorHandler.handleProcessingError(actionError, 'action', actionType);
+  return json({
+    success: false,
+    error: errorDetails.message,
+    errorType: errorDetails.type,
+    recoverable: errorDetails.recoverable
+  });
+}
 };
 
 interface SelectedVariant {
@@ -643,11 +791,15 @@ interface PricingRule {
   changeCompareAt: boolean;
 }
 
-export default function Admin() {
-  const { shop, activeCampaigns } = useLoaderData<typeof loader>();
+export default function CreatePricingJob() {
+  const { shop, activeCampaigns, templates } = useLoaderData<typeof loader>();
   const [selectedVariants, setSelectedVariants] = useState<SelectedVariant[]>([]);
   const [currentAction, setCurrentAction] = useState<string | null>(null);
   const [jobName, setJobName] = useState<string>('');
+  const [showRuleConfig, setShowRuleConfig] = useState<boolean>(false);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string | undefined>();
+  const [exportMessage, setExportMessage] = useState<string | null>(null);
+  const [exportError, setExportError] = useState<boolean>(false);
   const [pricingRule, setPricingRule] = useState<PricingRule>({
     whenCondition: 'less_than_abs',
     whenValue: '20',
@@ -662,6 +814,47 @@ export default function Admin() {
   const isLoading = 
     ["loading", "submitting"].includes(fetcher.state) && 
     fetcher.formMethod === "POST";
+
+  // Export functionality
+  const handleExport = async (format: 'csv' | 'pdf') => {
+    if (!fetcher.data || !(fetcher.data as any).results) {
+      return Promise.reject(new Error('No results to export'));
+    }
+
+    const data = fetcher.data as any;
+    const exportData = {
+      jobName: jobName || 'Unnamed Pricing Job',
+      actionType: data.actionType || 'pricing_update',
+      totalProcessed: data.totalProcessed || data.results.length,
+      successCount: data.successCount || data.results.filter((r: any) => r.success).length,
+      failureCount: data.failureCount || data.results.filter((r: any) => !r.success && !r.reason).length,
+      skippedCount: data.skippedCount || data.results.filter((r: any) => r.reason && !r.success).length,
+      results: data.results,
+      createdAt: new Date(),
+      shopDomain: shop
+    };
+
+    const formData = new FormData();
+    formData.append('format', format);
+    formData.append('jobData', JSON.stringify(exportData));
+
+    const response = await fetch('/api/export', {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!response.ok) {
+      throw new Error('Export generation failed');
+    }
+
+    return await response.json();
+  };
+
+  // Handle export messages
+  const handleExportMessage = (message: string, isError: boolean = false) => {
+    setExportMessage(message);
+    setExportError(isError);
+  };
 
   // Dropdown options for rule configuration
   const whenConditionOptions = [
@@ -794,6 +987,81 @@ export default function Admin() {
       }
     }
   }, [fetcher.state, fetcher.data, shopify]);
+
+  // Template handling functions
+  const handleTemplateSelect = async (templateId: string | undefined) => {
+    setSelectedTemplateId(templateId);
+    
+    if (!templateId) {
+      return;
+    }
+
+    // Load template data
+    const formData = new FormData();
+    formData.append("action", "load_template");
+    formData.append("templateId", templateId);
+    
+    fetcher.submit(formData, { method: "post" });
+  };
+
+  const handleTemplateSave = async (templateData: { name: string; description?: string }) => {
+    const formData = new FormData();
+    formData.append("action", "save_template");
+    formData.append("templateName", templateData.name);
+    if (templateData.description) {
+      formData.append("templateDescription", templateData.description);
+    }
+    
+    // Convert current pricing rule to template format
+    const templateRules: TemplatePricingRule[] = [{
+      whenCondition: pricingRule.whenCondition === 'less_than_abs' ? 'less_than' : 
+                     pricingRule.whenCondition === 'more_than_abs' ? 'greater_than' : 'equal_to',
+      whenValue: pricingRule.whenValue,
+      thenAction: pricingRule.thenAction === 'increase_price' ? 'increase' : 
+                  pricingRule.thenAction === 'reduce_price' ? 'decrease' : 'set_to',
+      thenMode: pricingRule.thenMode === 'percentage' ? 'percentage' : 'fixed',
+      thenValue: pricingRule.thenValue,
+      changeCompareAt: pricingRule.changeCompareAt,
+    }];
+    
+    formData.append("rules", JSON.stringify(templateRules));
+    
+    fetcher.submit(formData, { method: "post" });
+  };
+
+  // Handle template loading result
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data && "template" in fetcher.data) {
+      const data = fetcher.data as any;
+      
+      if (data.success && data.template) {
+        const template = data.template as PricingJobTemplate;
+        
+        // Update job name if template name exists
+        if (template.name) {
+          setJobName(template.name);
+        }
+        
+        // Load template rules if they exist
+        if (template.rules && template.rules.length > 0) {
+          const rule = template.rules[0];
+          setPricingRule({
+            whenCondition: rule.whenCondition === 'less_than' ? 'less_than_abs' :
+                           rule.whenCondition === 'greater_than' ? 'more_than_abs' : 'less_than_abs',
+            whenValue: rule.whenValue,
+            thenAction: rule.thenAction === 'increase' ? 'increase_price' :
+                        rule.thenAction === 'decrease' ? 'reduce_price' : 'change_price',
+            thenMode: rule.thenMode === 'percentage' ? 'percentage' : 'absolute',
+            thenValue: rule.thenValue,
+            changeCompareAt: rule.changeCompareAt,
+          });
+          setShowRuleConfig(true);
+        }
+        
+        shopify.toast.show(`Template "${template.name}" loaded successfully`, { isError: false });
+      }
+    }
+  }, [fetcher.state, fetcher.data, shopify]);
   
   const pickResources = async () => {
     try {
@@ -923,36 +1191,321 @@ export default function Admin() {
   return (
     <Page>
       <TitleBar title="Create Pricing Job" />
-      <BlockStack gap="500">
-        
-        {/* Active Campaigns Section */}
+      
+      <BlockStack gap="600">
+        {/* Job Configuration Card */}
+        <Layout>
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="400">
+                <InlineStack align="space-between">
+                  <Text as="h2" variant="headingLg">Job Configuration</Text>
+                  <Badge tone="info">Step 1 of 4</Badge>
+                </InlineStack>
+                <TextField
+                  label="Job Name"
+                  value={jobName}
+                  onChange={setJobName}
+                  placeholder="e.g., Black Friday Prep Job, Winter Inventory Adjustment"
+                  helpText="Give your pricing job a memorable name to easily find it later"
+                  autoComplete="off"
+                  requiredIndicator
+                />
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        </Layout>
+
+        {/* Template Selector */}
+        <Layout>
+          <Layout.Section>
+            <TemplateSelector
+              templates={templates as unknown as PricingJobTemplate[]}
+              selectedTemplateId={selectedTemplateId}
+              onTemplateSelect={handleTemplateSelect}
+              onTemplateSave={handleTemplateSave}
+              currentRules={showRuleConfig ? [{
+                whenCondition: pricingRule.whenCondition === 'less_than_abs' ? 'less_than' : 
+                               pricingRule.whenCondition === 'more_than_abs' ? 'greater_than' : 'equal_to',
+                whenValue: pricingRule.whenValue,
+                thenAction: pricingRule.thenAction === 'increase_price' ? 'increase' : 
+                            pricingRule.thenAction === 'reduce_price' ? 'decrease' : 'set_to',
+                thenMode: pricingRule.thenMode === 'percentage' ? 'percentage' : 'fixed',
+                thenValue: pricingRule.thenValue,
+                changeCompareAt: pricingRule.changeCompareAt,
+              }] : undefined}
+              jobName={jobName}
+            />
+          </Layout.Section>
+        </Layout>
+
+        {/* Product Selection Card */}
+        <Layout>
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="500">
+                <InlineStack align="space-between">
+                  <BlockStack gap="200">
+                    <Text as="h2" variant="headingLg">Product Selection</Text>
+                    <Badge tone="info">Step 2 of 4</Badge>
+                  </BlockStack>
+                  <Button onClick={pickResources} variant="primary">
+                    Select Products & Variants
+                  </Button>
+                </InlineStack>
+                
+                <Text variant="bodyMd" as="p">
+                  Choose products or specific variants to apply pricing changes. You can select entire products 
+                  (all variants) or individual variants within products.
+                </Text>
+                
+                {selectedVariants.length === 0 ? (
+                  <EmptyState
+                    heading="No products selected"
+                    image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
+                  >
+                    <Text variant="bodyMd" as="p">
+                      Click "Select Products & Variants" above to choose which products you want to update.
+                    </Text>
+                  </EmptyState>
+                ) : (
+                  <Card background="bg-surface-secondary">
+                    <BlockStack gap="400">
+                      <InlineStack align="space-between">
+                        <Text as="h3" variant="headingMd">
+                          Selected Items ({selectedVariants.length} variants)
+                        </Text>
+                        <Button onClick={clearSelection} variant="tertiary">
+                          Clear Selection
+                        </Button>
+                      </InlineStack>
+                      
+                      <Text variant="bodyMd" as="p" tone="subdued">
+                        {(() => {
+                          const productCount = new Set(selectedVariants.map(v => v.productId)).size;
+                          return `From ${productCount} product${productCount === 1 ? '' : 's'}`;
+                        })()}
+                      </Text>
+                      
+                      <IndexTable
+                        resourceName={resourceName}
+                        itemCount={selectedVariants.length}
+                        headings={[
+                          { title: "Product" },
+                          { title: "Variant" },
+                          { title: "Current Price" },
+                          { title: "Variant ID" },
+                        ]}
+                        selectable={false}
+                        condensed
+                      >
+                        {rowMarkup}
+                      </IndexTable>
+                    </BlockStack>
+                  </Card>
+                )}
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        </Layout>
+
+        {/* Pricing Rules Configuration Card */}
+        <Layout>
+          <Layout.Section>
+            <Card>
+              <BlockStack gap="500">
+                <InlineStack align="space-between">
+                  <BlockStack gap="200">
+                    <Text as="h2" variant="headingLg">Pricing Method</Text>
+                    <Badge tone="info">Step 3 of 4</Badge>
+                  </BlockStack>
+                  <Button 
+                    onClick={() => setShowRuleConfig(!showRuleConfig)}
+                    variant={showRuleConfig ? "primary" : "secondary"}
+                    disclosure={showRuleConfig ? "up" : "down"}
+                  >
+                    {showRuleConfig ? "Hide" : "Configure"} Advanced Rules
+                  </Button>
+                </InlineStack>
+                
+                {selectedVariants.length > 0 && (
+                  <InlineStack gap="300" align="start">
+                    <Button 
+                      variant="primary"
+                      size="large"
+                      loading={isLoading && currentAction === "bulk_update"}
+                      onClick={increasePrices}
+                      disabled={!jobName.trim()}
+                    >
+                      Quick Price Increase (+$10)
+                    </Button>
+                    
+                    <Button 
+                      variant="secondary"
+                      size="large"
+                      loading={isLoading && currentAction === "inventory_rules"}
+                      onClick={applyInventoryRules}
+                      disabled={!jobName.trim()}
+                    >
+                      Apply Custom Rules
+                    </Button>
+                  </InlineStack>
+                )}
+                
+                {!jobName.trim() && selectedVariants.length > 0 && (
+                  <Banner tone="info">
+                    <Text variant="bodyMd" as="p">
+                      Please enter a job name before running pricing updates.
+                    </Text>
+                  </Banner>
+                )}
+
+                {showRuleConfig && (
+                  <Card background="bg-surface-secondary">
+                    <BlockStack gap="500">
+                      <Text as="h3" variant="headingMd">
+                        Advanced Pricing Rules Configuration
+                      </Text>
+                      
+                      <BlockStack gap="400">
+                        {/* WHEN Section */}
+                        <BlockStack gap="300">
+                          <Text as="h4" variant="headingSm">
+                            WHEN: Inventory Condition
+                          </Text>
+                          <InlineStack gap="300" align="start">
+                            <div style={{ minWidth: '200px' }}>
+                              <Select
+                                label="Condition type"
+                                options={whenConditionOptions}
+                                value={pricingRule.whenCondition}
+                                onChange={(value) => setPricingRule(prev => ({ ...prev, whenCondition: value as PricingRule['whenCondition'] }))}
+                              />
+                            </div>
+                            <div style={{ minWidth: '100px' }}>
+                              <TextField
+                                label="Value"
+                                type="number"
+                                value={pricingRule.whenValue}
+                                onChange={(value) => setPricingRule(prev => ({ ...prev, whenValue: value }))}
+                                autoComplete="off"
+                              />
+                            </div>
+                          </InlineStack>
+                        </BlockStack>
+                        
+                        {/* THEN Section */}
+                        <BlockStack gap="300">
+                          <Text as="h4" variant="headingSm">
+                            THEN: Price Action
+                          </Text>
+                          <InlineStack gap="300" align="start">
+                            <div style={{ minWidth: '150px' }}>
+                              <Select
+                                label="Action"
+                                options={thenActionOptions}
+                                value={pricingRule.thenAction}
+                                onChange={(value) => setPricingRule(prev => ({ ...prev, thenAction: value as PricingRule['thenAction'] }))}
+                              />
+                            </div>
+                            <div style={{ minWidth: '150px' }}>
+                              <Select
+                                label="Mode"
+                                options={thenModeOptions}
+                                value={pricingRule.thenMode}
+                                onChange={(value) => setPricingRule(prev => ({ ...prev, thenMode: value as PricingRule['thenMode'] }))}
+                              />
+                            </div>
+                            <div style={{ minWidth: '100px' }}>
+                              <TextField
+                                label="Value"
+                                type="number"
+                                value={pricingRule.thenValue}
+                                onChange={(value) => setPricingRule(prev => ({ ...prev, thenValue: value }))}
+                                autoComplete="off"
+                              />
+                            </div>
+                          </InlineStack>
+                        </BlockStack>
+                        
+                        {/* Optional Settings */}
+                        <Checkbox
+                          label="Also update compare-at price"
+                          checked={pricingRule.changeCompareAt}
+                          onChange={(checked) => setPricingRule(prev => ({ ...prev, changeCompareAt: checked }))}
+                        />
+                        
+                        {/* Example Variant Preview */}
+                        <Card>
+                          <BlockStack gap="300">
+                            <Text as="h5" variant="headingSm">
+                              Rule Preview Example
+                            </Text>
+                            {(() => {
+                              const examplePrice = 25.00;
+                              const exampleInventory = 15;
+                              const { updatedPrice, willUpdate } = calculatePreviewPrice(examplePrice, exampleInventory);
+                              
+                              return (
+                                <BlockStack gap="200">
+                                  <InlineStack gap="300">
+                                    <Text variant="bodyMd" as="p">
+                                      <strong>Current price:</strong> ${examplePrice.toFixed(2)}
+                                    </Text>
+                                    <Text variant="bodyMd" as="p">
+                                      <strong>Inventory:</strong> {exampleInventory} units
+                                    </Text>
+                                  </InlineStack>
+                                  <Text 
+                                    variant="bodyMd" 
+                                    as="p" 
+                                    tone={willUpdate ? "success" : "subdued"}
+                                  >
+                                    <strong>Result:</strong> ${updatedPrice.toFixed(2)}
+                                    <Badge tone={willUpdate ? "success" : "info"} size="small">
+                                      {willUpdate ? "Rule applies" : "Rule skipped"}
+                                    </Badge>
+                                  </Text>
+                                </BlockStack>
+                              );
+                            })()}
+                          </BlockStack>
+                        </Card>
+                      </BlockStack>
+                    </BlockStack>
+                  </Card>
+                )}
+              </BlockStack>
+            </Card>
+          </Layout.Section>
+        </Layout>
+
+        {/* Active Campaigns Info (Moved to sidebar-style) */}
         {activeCampaigns.length > 0 && (
           <Layout>
-            <Layout.Section>
+            <Layout.Section variant="oneThird">
               <Card>
                 <BlockStack gap="400">
                   <Text as="h2" variant="headingMd">
                     Active Campaigns ({activeCampaigns.length})
                   </Text>
-                  {activeCampaigns.map((campaign) => (
-                    <Card key={campaign.id}>
+                  <Text variant="bodyMd" as="p" tone="subdued">
+                    These campaigns are currently running automated pricing rules.
+                  </Text>
+                  {activeCampaigns.slice(0, 3).map((campaign) => campaign && (
+                    <Card key={campaign.id} background="bg-surface-secondary">
                       <BlockStack gap="200">
                         <InlineStack gap="300" align="space-between">
                           <Text variant="headingSm" as="h3">
                             {campaign.name}
                           </Text>
-                          <Badge tone="success">
+                          <Badge tone="success" size="small">
                             {campaign.status}
                           </Badge>
                         </InlineStack>
-                        {campaign.description && (
-                          <Text variant="bodyMd" as="p" tone="subdued">
-                            {campaign.description}
-                          </Text>
-                        )}
                         <InlineStack gap="200">
                           <Text variant="bodySm" as="span" tone="subdued">
-                            Triggered: {campaign.triggerCount} times
+                            {campaign.triggerCount} triggers
                           </Text>
                           {campaign.lastTriggered && (
                             <Text variant="bodySm" as="span" tone="subdued">
@@ -963,254 +1516,32 @@ export default function Admin() {
                       </BlockStack>
                     </Card>
                   ))}
+                  {activeCampaigns.length > 3 && (
+                    <Text variant="bodyMd" as="p" tone="subdued">
+                      ... and {activeCampaigns.length - 3} more campaigns
+                    </Text>
+                  )}
                 </BlockStack>
               </Card>
             </Layout.Section>
           </Layout>
         )}
 
-        <Layout>
-          <Layout.Section>
-            <Card>
+        {/* Results Section */}
+        {fetcher.data && "results" in fetcher.data && (
+          <Layout>
+            <Layout.Section>
               <BlockStack gap="400">
-                <Text as="h2" variant="headingLg">Job Configuration</Text>
-                <TextField
-                  label="Job Name"
-                  value={jobName}
-                  onChange={setJobName}
-                  placeholder="Enter a descriptive name for this pricing job"
-                  helpText="This name will help you identify this job in the dashboard"
-                  autoComplete="off"
-                />
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-        </Layout>
-
-        <Layout>
-          <Layout.Section>
-            <Card>
-              <BlockStack gap="500">
-                <BlockStack gap="200">
-                  <Text as="h2" variant="headingMd">
-                    Step 1 - Select Products & Variants
-                  </Text>
-                  <Text variant="bodyMd" as="p">
-                    Select products or individual variants within products. You can either apply a simple $10 increase to all prices, 
-                    or use the configurable rules below to apply conditional pricing based on inventory levels.
-                    You can select entire products (all variants) or choose specific variants within products.
-                  </Text>
-                </BlockStack>
-                
-                <InlineStack gap="300" align="start">
-                  <Button onClick={pickResources}>
-                    Select Products & Variants
-                  </Button>
-                  
-                  {selectedVariants.length > 0 && (
-                    <>
-                      <Button 
-                        variant="primary"
-                        loading={isLoading && currentAction === "bulk_update"}
-                        onClick={increasePrices}
-                      >
-                        Increase Prices by $10 ({selectedVariants.length.toString()} variants)
-                      </Button>
-                      
-                      <Button 
-                        variant="secondary"
-                        loading={isLoading && currentAction === "inventory_rules"}
-                        onClick={applyInventoryRules}
-                      >
-                        Apply Configured Rules ({selectedVariants.length.toString()} variants)
-                      </Button>
-                      
-                      <Button onClick={clearSelection}>
-                        Clear Selection
-                      </Button>
-                    </>
-                  )}
+                <InlineStack align="space-between">
+                  <Text as="h2" variant="headingLg">Execution Results</Text>
+                  <Badge tone="info">Step 4 of 4</Badge>
                 </InlineStack>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-          
-          <Layout.Section>
-            <Card>
-              <BlockStack gap="500">
-                <BlockStack gap="200">
-                  <Text as="h2" variant="headingMd">
-                    Step 2 - Configure Pricing Rules
-                  </Text>
-                  <Text variant="bodyMd" as="p">
-                    Set up conditional pricing rules based on inventory levels and other criteria.
-                  </Text>
-                </BlockStack>
-                
-                <BlockStack gap="400">
-                  {/* WHEN Section */}
-                  <BlockStack gap="300">
-                    <Text as="h3" variant="headingSm">
-                      WHEN: Inventory
-                    </Text>
-                    <InlineStack gap="300" align="start">
-                      <div style={{ minWidth: '200px' }}>
-                        <Select
-                          label="Condition type"
-                          options={whenConditionOptions}
-                          value={pricingRule.whenCondition}
-                          onChange={(value) => setPricingRule(prev => ({ ...prev, whenCondition: value as PricingRule['whenCondition'] }))}
-                        />
-                      </div>
-                      <div style={{ minWidth: '100px' }}>
-                        <TextField
-                          label="Value"
-                          type="number"
-                          value={pricingRule.whenValue}
-                          onChange={(value) => setPricingRule(prev => ({ ...prev, whenValue: value }))}
-                          autoComplete="off"
-                        />
-                      </div>
-                    </InlineStack>
-                  </BlockStack>
-                  
-                  {/* THEN Section */}
-                  <BlockStack gap="300">
-                    <Text as="h3" variant="headingSm">
-                      THEN: Price Action
-                    </Text>
-                    <InlineStack gap="300" align="start">
-                      <div style={{ minWidth: '150px' }}>
-                        <Select
-                          label="Action"
-                          options={thenActionOptions}
-                          value={pricingRule.thenAction}
-                          onChange={(value) => setPricingRule(prev => ({ ...prev, thenAction: value as PricingRule['thenAction'] }))}
-                        />
-                      </div>
-                      <div style={{ minWidth: '150px' }}>
-                        <Select
-                          label="Mode"
-                          options={thenModeOptions}
-                          value={pricingRule.thenMode}
-                          onChange={(value) => setPricingRule(prev => ({ ...prev, thenMode: value as PricingRule['thenMode'] }))}
-                        />
-                      </div>
-                      <div style={{ minWidth: '100px' }}>
-                        <TextField
-                          label="Value"
-                          type="number"
-                          value={pricingRule.thenValue}
-                          onChange={(value) => setPricingRule(prev => ({ ...prev, thenValue: value }))}
-                          autoComplete="off"
-                        />
-                      </div>
-                    </InlineStack>
-                  </BlockStack>
-                  
-                  {/* Optional Settings */}
-                  <Checkbox
-                    label="Do you want to change compare-at also?"
-                    checked={pricingRule.changeCompareAt}
-                    onChange={(checked) => setPricingRule(prev => ({ ...prev, changeCompareAt: checked }))}
-                  />
-                  
-                  {/* Example Variant Preview */}
-                  <Card>
-                    <BlockStack gap="300">
-                      <Text as="h4" variant="headingSm">
-                        Example Variant Preview
-                      </Text>
-                      {(() => {
-                        const examplePrice = 25.00;
-                        const exampleInventory = 15;
-                        const { updatedPrice, willUpdate } = calculatePreviewPrice(examplePrice, exampleInventory);
-                        
-                        return (
-                          <BlockStack gap="200">
-                            <Text variant="bodyMd" as="p">
-                              <strong>Current price:</strong> ${examplePrice.toFixed(2)}
-                            </Text>
-                            <Text variant="bodyMd" as="p">
-                              <strong>Inventory level:</strong> {exampleInventory} units
-                            </Text>
-                            <Text 
-                              variant="bodyMd" 
-                              as="p" 
-                              tone={willUpdate ? "success" : "subdued"}
-                            >
-                              <strong>Updated price:</strong> ${updatedPrice.toFixed(2)}
-                              {willUpdate ? " (Rule will apply)" : " (Rule will NOT apply)"}
-                            </Text>
-                          </BlockStack>
-                        );
-                      })()}
-                    </BlockStack>
-                  </Card>
-                </BlockStack>
-              </BlockStack>
-            </Card>
-          </Layout.Section>
-          
-          {selectedVariants.length > 0 && (
-            <Layout.Section>
-              <Card>
-                <BlockStack gap="400">
-                  <BlockStack gap="200">
-                    <Text as="h3" variant="headingMd">
-                      Selected Variants ({selectedVariants.length})
-                    </Text>
-                    <Text variant="bodyMd" as="p" tone="subdued">
-                      {(() => {
-                        const productCount = new Set(selectedVariants.map(v => v.productId)).size;
-                        return `From ${productCount} product${productCount === 1 ? '' : 's'}`;
-                      })()}
-                    </Text>
-                  </BlockStack>
-                  
-                  <IndexTable
-                    resourceName={resourceName}
-                    itemCount={selectedVariants.length}
-                    headings={[
-                      { title: "Product" },
-                      { title: "Variant" },
-                      { title: "Current Price" },
-                      { title: "Variant ID" },
-                    ]}
-                    selectable={false}
-                  >
-                    {rowMarkup}
-                  </IndexTable>
-                </BlockStack>
-              </Card>
-            </Layout.Section>
-          )}
-          
-          {selectedVariants.length === 0 && (
-            <Layout.Section>
-              <Card>
-                <EmptyState
-                  heading="No variants selected"
-                  image="https://cdn.shopify.com/s/files/1/0262/4071/2726/files/emptystate-files.png"
-                >
-                  <Text variant="bodyMd" as="p">
-                    Use the resource picker above to select products and their variants for bulk price updates.
-                    You can select entire products or individual variants within products.
-                  </Text>
-                </EmptyState>
-              </Card>
-            </Layout.Section>
-          )}
-          
-          {/* Results Banners */}
-          {fetcher.data && "results" in fetcher.data && (
-            <Layout.Section>
-              <BlockStack gap="400">
+
                 {fetcher.data.success && "successCount" in fetcher.data && fetcher.data.successCount > 0 && (
                   <Banner title={
                     (fetcher.data as any).actionType === "inventory_rules" 
-                      ? "Inventory Rules Results" 
-                      : "Bulk Update Results"
+                      ? "Inventory Rules Applied Successfully" 
+                      : "Bulk Update Completed Successfully"
                   } tone="success">
                     <BlockStack gap="200">
                       <Text variant="bodyMd" as="p">
@@ -1218,7 +1549,7 @@ export default function Admin() {
                       </Text>
                       {(fetcher.data as any).actionType === "inventory_rules" && "skippedCount" in fetcher.data && (fetcher.data as any).skippedCount > 0 && (
                         <Text variant="bodyMd" as="p">
-                          {(fetcher.data as any).skippedCount} variants were skipped (inventory ≥ 20 or not tracked).
+                          {(fetcher.data as any).skippedCount} variants were skipped (conditions not met).
                         </Text>
                       )}
                       {"failureCount" in fetcher.data && fetcher.data.failureCount > 0 && (
@@ -1231,7 +1562,7 @@ export default function Admin() {
                 )}
                 
                 {"failureCount" in fetcher.data && fetcher.data.failureCount > 0 && (
-                  <Banner title="Update Errors" tone="warning">
+                  <Banner title="Some Updates Failed" tone="warning">
                     <BlockStack gap="200">
                       {fetcher.data.results
                         .filter((result: any) => !result.success && !result.reason) // Only show actual errors, not skipped variants
@@ -1251,99 +1582,65 @@ export default function Admin() {
                 )}
                 
                 {fetcher.data.success && (
-                  <Card>
-                    <BlockStack gap="400">
-                      <Text as="h3" variant="headingMd">
-                        Detailed Results
-                      </Text>
-                      
-                      <IndexTable
-                        resourceName={{ singular: "result", plural: "results" }}
-                        itemCount={fetcher.data.results.length}
-                        headings={
-                          (fetcher.data as any).actionType === "inventory_rules" 
-                            ? [
-                                { title: "Product" },
-                                { title: "Variant" },
-                                { title: "Inventory" },
-                                { title: "Status" },
-                                { title: "Price Change / Reason" },
-                              ]
-                            : [
-                                { title: "Product" },
-                                { title: "Variant" },
-                                { title: "Status" },
-                                { title: "Price Change" },
-                              ]
-                        }
-                        selectable={false}
-                      >
-                        {fetcher.data.results.map((result: any, index: number) => (
-                          <IndexTable.Row id={result.variantId} key={result.variantId} position={index}>
-                            <IndexTable.Cell>
-                              <Text variant="bodyMd" as="span">
-                                {result.productTitle || "Unknown"}
-                              </Text>
-                            </IndexTable.Cell>
-                            <IndexTable.Cell>
-                              <Text variant="bodyMd" as="span">
-                                {result.variantTitle || "Unknown"}
-                              </Text>
-                            </IndexTable.Cell>
-                            {(fetcher.data as any).actionType === "inventory_rules" && (
-                              <IndexTable.Cell>
-                                <Text variant="bodyMd" as="span">
-                                  {result.inventory !== undefined ? result.inventory.toString() : "N/A"}
-                                </Text>
-                              </IndexTable.Cell>
-                            )}
-                            <IndexTable.Cell>
-                              <Badge tone={
-                                result.success 
-                                  ? "success" 
-                                  : result.reason 
-                                    ? "attention" 
-                                    : "critical"
-                              }>
-                                {result.success ? "Updated" : result.reason ? "Skipped" : "Failed"}
-                              </Badge>
-                            </IndexTable.Cell>
-                            <IndexTable.Cell>
-                              {result.success && result.oldPrice && result.newPrice ? (
-                                <Text variant="bodyMd" as="span">
-                                  ${result.oldPrice} → ${result.newPrice}
-                                </Text>
-                              ) : result.reason ? (
-                                <Text variant="bodyMd" as="span" tone="subdued">
-                                  {result.reason}
-                                </Text>
-                              ) : (
-                                <Text variant="bodyMd" as="span" tone="subdued">
-                                  {result.error || "N/A"}
-                                </Text>
-                              )}
-                            </IndexTable.Cell>
-                          </IndexTable.Row>
-                        ))}
-                      </IndexTable>
-                    </BlockStack>
-                  </Card>
+                  <EnhancedResultsTable
+                    jobName={jobName || 'Unnamed Pricing Job'}
+                    actionType={(fetcher.data as any).actionType || 'pricing_update'}
+                    totalProcessed={(fetcher.data as any).totalProcessed || (fetcher.data as any).results?.length || 0}
+                    successCount={(fetcher.data as any).successCount || (fetcher.data as any).results?.filter((r: any) => r.success).length || 0}
+                    failureCount={(fetcher.data as any).failureCount || (fetcher.data as any).results?.filter((r: any) => !r.success && !r.reason).length || 0}
+                    skippedCount={(fetcher.data as any).skippedCount || (fetcher.data as any).results?.filter((r: any) => r.reason && !r.success).length || 0}
+                    results={(fetcher.data as any).results || []}
+                    shopDomain={shop}
+                    onExport={handleExport}
+                    onMessage={handleExportMessage}
+                  />
+                )}
+
+                {fetcher.data.success && (fetcher.data as any).successCount > 0 && (
+                  <CampaignIntegrationHint
+                    jobName={jobName || 'Unnamed Pricing Job'}
+                    rules={currentAction === 'inventory_rules' ? [pricingRule] : undefined}
+                    bulkAmount={undefined}
+                    bulkType={undefined}
+                    successCount={(fetcher.data as any).successCount || 0}
+                    totalProcessed={(fetcher.data as any).totalProcessed || 0}
+                  />
                 )}
               </BlockStack>
             </Layout.Section>
-          )}
-          
-          {fetcher.data?.success === false && "error" in fetcher.data && !("results" in fetcher.data) && (
+          </Layout>
+        )}
+        
+        {fetcher.data?.success === false && "error" in fetcher.data && !("results" in fetcher.data) && (
+          <Layout>
             <Layout.Section>
-              <Banner title="Error" tone="critical">
+              <Banner title="Job Failed" tone="critical">
                 <Text variant="bodyMd" as="p">
                   Bulk update failed: {(fetcher.data as any).error}
                 </Text>
               </Banner>
             </Layout.Section>
-          )}
-        </Layout>
+          </Layout>
+        )}
       </BlockStack>
+
+      {/* Export Messages */}
+      {exportMessage && (
+        <div style={{ position: 'fixed', top: '80px', right: '20px', zIndex: 1000, maxWidth: '400px' }}>
+          <Banner
+            title={exportError ? "Export Failed" : "Export Complete"}
+            tone={exportError ? "critical" : "success"}
+            onDismiss={() => {
+              setExportMessage(null);
+              setExportError(false);
+            }}
+          >
+            <Text variant="bodyMd" as="p">
+              {exportMessage}
+            </Text>
+          </Banner>
+        </div>
+      )}
     </Page>
   );
 }

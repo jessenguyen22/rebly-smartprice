@@ -26,10 +26,13 @@ import {
 } from "@shopify/polaris-icons";
 import { authenticate } from "../shopify.server";
 import { createDatabaseManager } from "../models/database-manager.server";
+import { initializeCampaignProcessing } from "../services/campaign-session-integration.server";
+import { ClientOnly } from "../components/ClientOnly";
 import { json } from "@remix-run/node";
 
-export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+export const loader = async (args: LoaderFunctionArgs) => {
+  // Initialize campaign processing with admin client registration
+  const { session, admin } = await initializeCampaignProcessing.initializeCampaignProcessingFromLoader(args);
   
   try {
     // Use database manager for optimized connection handling
@@ -230,52 +233,60 @@ export default function Dashboard() {
                 </InlineStack>
                 
                 {recentJobsTableData.length > 0 ? (
-                  <IndexTable
-                    itemCount={recentJobsTableData.length}
-                    headings={[
-                      { title: 'Job Name' },
-                      { title: 'Type' },
-                      { title: 'Status' },
-                      { title: 'Variants' },
-                      { title: 'Success Rate' },
-                      { title: 'Created' }
-                    ]}
-                    selectable={false}
+                  <ClientOnly 
+                    fallback={
+                      <div style={{ padding: '2rem', textAlign: 'center' }}>
+                        <Text variant="bodyMd" as="p">Loading recent jobs...</Text>
+                      </div>
+                    }
                   >
-                    {recentJobsTableData.map((job: any, index: number) => (
-                      <IndexTable.Row id={job.id} key={job.id} position={index}>
-                        <IndexTable.Cell>
-                          <Text as="span" variant="bodyMd" fontWeight="medium">
-                            {job.name}
-                          </Text>
-                        </IndexTable.Cell>
-                        <IndexTable.Cell>
-                          <Badge tone="info">{job.type}</Badge>
-                        </IndexTable.Cell>
-                        <IndexTable.Cell>
-                          <Badge {...getStatusBadge(job.status)} />
-                        </IndexTable.Cell>
-                        <IndexTable.Cell>
-                          <Text as="span" variant="bodyMd">
-                            {job.totalVariants}
-                          </Text>
-                        </IndexTable.Cell>
-                        <IndexTable.Cell>
-                          <Text as="span" variant="bodyMd">
-                            {job.totalVariants > 0 ? 
-                              `${Math.round((job.successCount / job.totalVariants) * 100)}%` : 
-                              'N/A'
-                            }
-                          </Text>
-                        </IndexTable.Cell>
-                        <IndexTable.Cell>
-                          <Text as="span" variant="bodyMd" tone="subdued">
-                            {formatDateTime(job.createdAt)}
-                          </Text>
-                        </IndexTable.Cell>
-                      </IndexTable.Row>
-                    ))}
-                  </IndexTable>
+                    <IndexTable
+                      itemCount={recentJobsTableData.length}
+                      headings={[
+                        { title: 'Job Name' },
+                        { title: 'Type' },
+                        { title: 'Status' },
+                        { title: 'Variants' },
+                        { title: 'Success Rate' },
+                        { title: 'Created' }
+                      ]}
+                      selectable={false}
+                    >
+                      {recentJobsTableData.map((job: any, index: number) => (
+                        <IndexTable.Row id={job.id} key={job.id} position={index}>
+                          <IndexTable.Cell>
+                            <Text as="span" variant="bodyMd" fontWeight="medium">
+                              {job.name}
+                            </Text>
+                          </IndexTable.Cell>
+                          <IndexTable.Cell>
+                            <Badge tone="info">{job.type}</Badge>
+                          </IndexTable.Cell>
+                          <IndexTable.Cell>
+                            <Badge {...getStatusBadge(job.status)} />
+                          </IndexTable.Cell>
+                          <IndexTable.Cell>
+                            <Text as="span" variant="bodyMd">
+                              {job.totalVariants}
+                            </Text>
+                          </IndexTable.Cell>
+                          <IndexTable.Cell>
+                            <Text as="span" variant="bodyMd">
+                              {job.totalVariants > 0 ? 
+                                `${Math.round((job.successCount / job.totalVariants) * 100)}%` : 
+                                'N/A'
+                              }
+                            </Text>
+                          </IndexTable.Cell>
+                          <IndexTable.Cell>
+                            <Text as="span" variant="bodyMd" tone="subdued">
+                              {formatDateTime(job.createdAt)}
+                            </Text>
+                          </IndexTable.Cell>
+                        </IndexTable.Row>
+                      ))}
+                    </IndexTable>
+                  </ClientOnly>
                 ) : (
                   <EmptyState
                     heading="No pricing jobs yet"
