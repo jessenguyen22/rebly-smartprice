@@ -5,7 +5,6 @@ import { useLoaderData, useNavigate, useSubmit, useNavigation, useRevalidator } 
 import { Page, Card, Text } from '@shopify/polaris';
 import { TitleBar } from '@shopify/app-bridge-react';
 import { CampaignDashboard } from '../components/campaigns/CampaignDashboard';
-import { AuthErrorHandler, useAuthErrorHandler } from '../components/AuthErrorHandler';
 import { CampaignService, type CampaignWithRules } from '../lib/services/CampaignService';
 import { authenticate } from "../shopify.server";
 import { prisma } from '../db.server';
@@ -178,56 +177,39 @@ export async function action({ request }: ActionFunctionArgs) {
   const submit = useSubmit();
   const navigation = useNavigation();
   const revalidator = useRevalidator();
-  const { handleAuthError } = useAuthErrorHandler();
 
   const isSubmitting = navigation.state === 'submitting';
-
-  // Handle authentication errors
-  React.useEffect(() => {
-    if ('error' in data && data.error) {
-      console.error('📋 Campaigns loader error:', data.error);
-      
-      // Check if it's an authentication-related error
-      if (data.error.includes('session') || data.error.includes('auth')) {
-        handleAuthError({ status: 401, message: data.error });
-      }
-    }
-  }, [data, handleAuthError]);
 
   // Type guard to check if data has error
   if ('error' in data) {
     return (
-      <AuthErrorHandler>
-        <Page>
-          <TitleBar title="Campaign Dashboard" />
-          <Card>
-            <div style={{ padding: '20px', textAlign: 'center' }}>
-              <Text as="p" tone="critical">
-                {data.error || 'Failed to load campaigns.'}
-              </Text>
-              <div style={{ marginTop: '16px' }}>
-                <button 
-                  onClick={() => revalidator.revalidate()}
-                  style={{
-                    padding: '8px 16px',
-                    backgroundColor: '#008060',
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '4px',
-                    cursor: 'pointer'
-                  }}
-                >
-                  Refresh Data
-                </button>
-              </div>
+      <Page>
+        <TitleBar title="Campaign Dashboard" />
+        <Card>
+          <div style={{ padding: '20px', textAlign: 'center' }}>
+            <Text as="p" tone="critical">
+              {data.error || 'Failed to load campaigns.'}
+            </Text>
+            <div style={{ marginTop: '16px' }}>
+              <button 
+                onClick={() => revalidator.revalidate()}
+                style={{
+                  padding: '8px 16px',
+                  backgroundColor: '#008060',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: 'pointer'
+                }}
+              >
+                Refresh Data
+              </button>
             </div>
-          </Card>
-        </Page>
-      </AuthErrorHandler>
+          </div>
+        </Card>
+      </Page>
     );
-  }
-
-  const { campaigns } = data;
+  }  const { campaigns } = data;
 
   const handleCreateCampaign = () => {
     console.log('🎯 Create campaign clicked');
@@ -279,21 +261,19 @@ export async function action({ request }: ActionFunctionArgs) {
   };
 
   return (
-    <AuthErrorHandler>
-      <Page>
-        <TitleBar title="Campaign Dashboard" />
-        
-        <CampaignDashboard 
-          campaigns={campaigns}
-          isLoading={isSubmitting}
-          onCreateCampaign={handleCreateCampaign}
-          onEditCampaign={handleEditCampaign}
-          onToggleCampaignStatus={handleToggleCampaignStatus}
-          onDeleteCampaign={handleDeleteCampaign}
-          onViewCampaignDetails={handleViewDetails}
-          onRefresh={handleRefresh}
-        />
-      </Page>
-    </AuthErrorHandler>
+    <Page>
+      <TitleBar title="Campaign Dashboard" />
+      
+      <CampaignDashboard 
+        campaigns={campaigns}
+        isLoading={isSubmitting}
+        onCreateCampaign={handleCreateCampaign}
+        onEditCampaign={handleEditCampaign}
+        onToggleCampaignStatus={handleToggleCampaignStatus}
+        onDeleteCampaign={handleDeleteCampaign}
+        onViewCampaignDetails={handleViewDetails}
+        onRefresh={handleRefresh}
+      />
+    </Page>
   );
 }
