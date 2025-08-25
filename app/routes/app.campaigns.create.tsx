@@ -158,12 +158,58 @@ export async function action(args: ActionFunctionArgs) {
     }
 
     const campaignData: CreateCampaignData = JSON.parse(campaignDataStr);
+    console.log('📋 Parsing campaign data:', { name: campaignData.name, targetProductsCount: campaignData.targetProducts?.length || 0 });
     
     // Transform the campaign data to the expected format
     const transformedData = transformCampaignData(campaignData);
+    console.log('🔄 Transformed campaign data:', { name: transformedData.name, productIds: transformedData.targetProducts.productIds?.length || 0 });
+    
+    // Check for overlaps (unless explicitly bypassing)
+    const bypassOverlapCheck = formData.get('bypassOverlapCheck') === 'true';
+    
+    if (!bypassOverlapCheck) {
+      try {
+        const productIds = transformedData.targetProducts.productIds || [];
+        console.log(`🔍 Checking overlaps for ${productIds.length} products:`, productIds);
+        
+        if (productIds.length > 0) {
+          const overlapResult = await campaignService.checkProductOverlaps(transformedData);
+          console.log('✅ Overlap check completed:', { hasOverlaps: overlapResult.hasOverlaps, count: overlapResult.overlappingProducts.length });
+          
+          if (overlapResult.hasOverlaps) {
+            console.log('⚠️ Overlaps detected, returning conflict response');
+            // Return overlap information for UI to handle
+            return json({
+              overlaps: overlapResult.overlappingProducts,
+              hasOverlaps: true,
+              campaignData: transformedData
+            }, { status: 409 }); // 409 Conflict
+          }
+        } else {
+          console.log('ℹ️ No products to check for overlaps');
+        }
+      } catch (overlapError) {
+        console.error('❌ Overlap check failed:', overlapError);
+        // Continue with campaign creation even if overlap check fails
+      }
+    } else {
+      console.log('🔄 Bypassing overlap check, removing products from existing campaigns');
+      // If bypassing overlap check, remove products from existing campaigns
+      const productIds = transformedData.targetProducts.productIds || [];
+      if (productIds.length > 0) {
+        try {
+          await campaignService.removeProductsFromCampaigns(productIds);
+          console.log('✅ Products removed from existing campaigns');
+        } catch (removeError) {
+          console.error('❌ Failed to remove products from campaigns:', removeError);
+        }
+      }
+    }
     
     // Create the campaign
+    console.log('🚀 Creating campaign with data:', { name: transformedData.name, productCount: transformedData.targetProducts.productIds?.length || 0 });
     const campaign = await campaignService.createCampaign(transformedData);
+    console.log('✅ Campaign created successfully:', campaign.id);
     
     // Redirect to the campaign details page
     return redirect(`/app/campaigns/${campaign.id}`);
@@ -183,9 +229,18 @@ export default function CampaignCreate() {
   
   const isSubmitting = navigation.state === 'submitting';
 
-  const handleSubmit = async (data: CreateCampaignData) => {
+  // Debug logging
+  console.log('🔍 ActionData:', actionData);
+  if (actionData && 'hasOverlaps' in actionData) {
+    console.log('⚠️ Overlaps detected in UI:', actionData.overlaps);
+  }
+
+  const handleSubmit = async (data: CreateCampaignData, bypassOverlapCheck = false) => {
     const formData = new FormData();
     formData.append('campaignData', JSON.stringify(data));
+    if (bypassOverlapCheck) {
+      formData.append('bypassOverlapCheck', 'true');
+    }
     submit(formData, { method: 'POST' });
   };
 
@@ -212,6 +267,12 @@ export default function CampaignCreate() {
           onSubmit={handleSubmit}
           onCancel={handleCancel}
           isSubmitting={isSubmitting}
+          overlapData={
+            actionData && 'hasOverlaps' in actionData && actionData.hasOverlaps ? {
+              overlaps: actionData.overlaps || [],
+              onBypassOverlap: (data: CreateCampaignData) => handleSubmit(data, true)
+            } : undefined
+          }
         />
       </BlockStack>
     </Page>

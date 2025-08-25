@@ -37,8 +37,8 @@ export class CampaignProcessingService {
   private shopId: string;
 
   // Constants for rate limiting
-  private static readonly PRICE_UPDATE_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes (increased from 5)
-  private static readonly CAMPAIGN_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+  private static readonly PRICE_UPDATE_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes (reduced from 10)
+  private static readonly CAMPAIGN_COOLDOWN_MS = 1 * 60 * 1000; // 1 minute (reduced from 2)
 
   constructor(
     private shopDomain: string,
@@ -208,8 +208,18 @@ export class CampaignProcessingService {
         if (payload.variants && Array.isArray(payload.variants)) {
           for (const variant of payload.variants) {
             const variantGid = `gid://shopify/ProductVariant/${variant.id}`;
-            if (await this.isVariantOnPriceCooldown(variantGid)) {
-              console.log(`🔄 Webhook from own price update detected for variant: ${variantGid}`);
+            
+            // Check both price cooldown and recent price change
+            const isOnCooldown = await this.isVariantOnPriceCooldown(variantGid);
+            
+            // Also check if price was just updated (compare timestamps)
+            const now = new Date();
+            const variantUpdatedAt = new Date(variant.updated_at || '1970-01-01');
+            const timeDifference = now.getTime() - variantUpdatedAt.getTime();
+            const wasRecentlyUpdated = timeDifference < 60000; // Within 1 minute
+            
+            if (isOnCooldown || wasRecentlyUpdated) {
+              console.log(`🔄 Webhook from own price update detected for variant: ${variantGid} (cooldown: ${isOnCooldown}, recent: ${wasRecentlyUpdated})`);
               return true;
             }
           }
@@ -478,12 +488,29 @@ export class CampaignProcessingService {
         }
       });
 
+      // Check for authentication errors
+      if (!response.ok && response.status === 302) {
+        console.error('🚫 GraphQL authentication failed - session expired');
+        return null;
+      }
+
       const data = await response.json();
       console.log('🔍 GraphQL response:', JSON.stringify(data, null, 2));
 
       if (data.errors) {
         console.error('❌ GraphQL errors:', data.errors);
-        return null;
+        
+        // Check for authentication-related errors
+        const authErrors = data.errors.filter((error: any) => 
+          error.message?.includes('access') || 
+          error.message?.includes('permission') ||
+          error.message?.includes('unauthorized')
+        );
+        
+        if (authErrors.length > 0) {
+          console.error('🚫 GraphQL authentication errors detected');
+          return null;
+        }
       }
 
       const variant = data.data?.inventoryItem?.variant;
@@ -496,6 +523,16 @@ export class CampaignProcessingService {
       return variant;
     } catch (error) {
       console.error('❌ Error getting variant from inventory item:', error);
+      
+      // Check if error is related to network/authentication
+      if (error instanceof Error && (
+        error.message.includes('fetch') || 
+        error.message.includes('network') ||
+        error.message.includes('timeout')
+      )) {
+        console.error('🌐 Network/Authentication error in GraphQL call');
+      }
+      
       return null;
     }
   }
@@ -546,7 +583,8 @@ export class CampaignProcessingService {
       const ruleResults = await this.evaluateCampaignRules(
         campaign.rules,
         currentVariant,
-        variantData.inventoryQuantity
+        variantData.inventoryQuantity,
+        webhookMessage
       );
 
       // Process rule results in batches
@@ -667,11 +705,35 @@ export class CampaignProcessingService {
         variables: { id: variantId }
       });
 
+      // Check for authentication errors before trying to parse JSON
+      if (!response.ok) {
+        if (response.status === 302) {
+          console.error('🚫 GraphQL authentication failed - session expired (302 redirect)');
+          return null;
+        } else {
+          console.error(`❌ GraphQL request failed with status: ${response.status}`);
+          return null;
+        }
+      }
+
       const data = await response.json();
       console.log('🔍 Variant details response:', JSON.stringify(data, null, 2));
 
       if (data.errors) {
         console.error('❌ GraphQL errors:', data.errors);
+        
+        // Check for specific authentication/permission errors
+        const hasAuthError = data.errors.some((error: any) => 
+          error.message?.includes('access') || 
+          error.message?.includes('permission') ||
+          error.message?.includes('unauthorized') ||
+          error.extensions?.code === 'ACCESS_DENIED'
+        );
+        
+        if (hasAuthError) {
+          console.error('🚫 GraphQL authentication/permission errors detected');
+        }
+        
         return null;
       }
 
@@ -691,71 +753,136 @@ export class CampaignProcessingService {
       console.error('❌ Error getting variant details:', error);
       if (error instanceof Error) {
         console.error('Error stack:', error.stack);
+        
+        // Check for specific error types
+        if (error.message.includes('fetch') || error.message.includes('Failed to fetch')) {
+          console.error('🌐 Network error in GraphQL request - possible session timeout');
+        }
       }
       return null;
     }
   }
 
   /**
-   * Evaluate campaign rules against variant inventory
+   * Evaluate campaign rules using Enterprise Rule Engine with threshold crossing detection
    */
-  private evaluateCampaignRules(
+  private async evaluateCampaignRules(
     rules: PricingRule[],
     variant: any,
-    inventoryQuantity: number
-  ): { rule: PricingRule; shouldApply: boolean; reason: string }[] {
-    return rules.map(rule => {
-      const evaluation = this.evaluateSingleRule(rule, variant, inventoryQuantity);
-      return {
-        rule,
-        shouldApply: evaluation.apply,
-        reason: evaluation.reason
-      };
-    });
+    inventoryQuantity: number,
+    webhookMessage: ShopifyWebhookMessage
+  ): Promise<{ rule: PricingRule; shouldApply: boolean; reason: string }[]> {
+    const results: { rule: PricingRule; shouldApply: boolean; reason: string }[] = [];
+    
+    // Import enterprise rule engine
+    const { EnterpriseRuleExecutionEngine } = await import('../lib/services/EnterpriseRuleExecutionEngine.server');
+
+    for (const rule of rules) {
+      try {
+        // Get campaign data
+        if (!rule.campaignId) {
+          console.error(`❌ No campaign ID for rule ${rule.id}`);
+          continue;
+        }
+
+        const campaign = await prisma.campaign.findUnique({
+          where: { id: rule.campaignId }
+        });
+
+        if (!campaign) {
+          console.error(`❌ Campaign not found for rule ${rule.id}`);
+          continue;
+        }
+
+        // Capture current variant state
+        await EnterpriseRuleExecutionEngine.captureVariantState(
+          variant.id,
+          variant.product?.id || 'unknown',
+          inventoryQuantity,
+          parseFloat(variant.price || '0'),
+          campaign.shopifyShopId,
+          `Webhook: ${webhookMessage.topic}`
+        );
+
+        // Create evaluation context
+        const currentState = {
+          variantId: variant.id,
+          productId: variant.product?.id || 'unknown',
+          inventoryQuantity,
+          priceAmount: parseFloat(variant.price || '0'),
+          capturedAt: new Date()
+        };
+
+        const context = {
+          rule,
+          campaign,
+          currentState
+        };
+
+        // Evaluate rule using enterprise engine
+        const evaluation = await EnterpriseRuleExecutionEngine.shouldExecuteRule(context);
+
+        console.log(`🏢 Enterprise evaluation for rule ${rule.id}:`, {
+          ruleCondition: rule.whenCondition,
+          threshold: rule.whenValue,
+          currentInventory: inventoryQuantity,
+          shouldExecute: evaluation.shouldExecute,
+          reason: evaluation.reason,
+          stateTransition: evaluation.stateTransition
+        });
+
+        results.push({
+          rule,
+          shouldApply: evaluation.shouldExecute,
+          reason: evaluation.reason
+        });
+
+      } catch (error) {
+        console.error(`❌ Enterprise rule evaluation failed for rule ${rule.id}:`, error);
+        
+        // Fallback to basic evaluation for this rule only
+        const fallbackEvaluation = this.fallbackRuleEvaluation(rule, variant, inventoryQuantity);
+        results.push({
+          rule,
+          shouldApply: fallbackEvaluation.apply,
+          reason: `Fallback: ${fallbackEvaluation.reason}`
+        });
+      }
+    }
+
+    return results;
   }
 
   /**
-   * Evaluate a single pricing rule
+   * Fallback rule evaluation for when enterprise engine fails
+   * Uses simple threshold checking without state management
    */
-  private evaluateSingleRule(
+  private fallbackRuleEvaluation(
     rule: PricingRule,
     variant: any,
     inventoryQuantity: number
   ): { apply: boolean; reason: string } {
+    console.warn('⚠️ Using fallback rule evaluation - enterprise engine failed');
+    
     const whenValue = parseFloat(rule.whenValue) || 0;
     
     switch (rule.whenCondition) {
       case 'less_than_abs':
         return {
           apply: inventoryQuantity < whenValue,
-          reason: inventoryQuantity < whenValue 
-            ? `Low inventory (${inventoryQuantity} < ${whenValue})` 
-            : `Inventory sufficient (${inventoryQuantity} >= ${whenValue})`
+          reason: `FALLBACK: Inventory ${inventoryQuantity} < ${whenValue}`
         };
         
       case 'more_than_abs':
         return {
           apply: inventoryQuantity > whenValue,
-          reason: inventoryQuantity > whenValue 
-            ? `High inventory (${inventoryQuantity} > ${whenValue})` 
-            : `Inventory not high enough (${inventoryQuantity} <= ${whenValue})`
-        };
-        
-      case 'decreases_by_abs':
-      case 'increases_by_abs':
-      case 'decreases_by_percent':
-      case 'increases_by_percent':
-        // For real-time processing, these would require historical data comparison
-        // For now, assume condition is met if we received an inventory webhook
-        return {
-          apply: true,
-          reason: `Inventory change detected (${rule.whenCondition})`
+          reason: `FALLBACK: Inventory ${inventoryQuantity} > ${whenValue}`
         };
         
       default:
         return {
           apply: false,
-          reason: `Unknown condition: ${rule.whenCondition}`
+          reason: `FALLBACK: Unsupported condition ${rule.whenCondition}`
         };
     }
   }
@@ -772,7 +899,7 @@ export class CampaignProcessingService {
     const results: Array<{ success: boolean; variantId: string; error?: string }> = [];
     const batchSize = 5;
 
-    // Get applicable rules
+    // Get applicable rules with prioritization
     const applicableRules = ruleResults.filter(r => r.shouldApply);
     
     if (applicableRules.length === 0) {
@@ -780,13 +907,17 @@ export class CampaignProcessingService {
       return variants.map(v => ({ success: false, variantId: v.id, error: 'No applicable rules' }));
     }
 
+    // Sort rules by priority (most specific condition first)
+    const prioritizedRules = this.prioritizeRules(applicableRules);
+    console.log(`🎯 Found ${applicableRules.length} applicable rules, using highest priority rule`);
+
     // Process variants in batches
     for (let i = 0; i < variants.length; i += batchSize) {
       const batch = variants.slice(i, i + batchSize);
       
       for (const variant of batch) {
         try {
-          const batchResult = await this.updateVariantPrice(variant, applicableRules, campaign, webhookMessage);
+          const batchResult = await this.updateVariantPrice(variant, prioritizedRules, campaign, webhookMessage);
           results.push(batchResult);
         } catch (error) {
           results.push({
@@ -807,17 +938,52 @@ export class CampaignProcessingService {
   }
 
   /**
+   * Prioritize applicable rules - most specific conditions win
+   * For inventory-based rules: smaller threshold = higher priority
+   * Example: inventory < 10 beats inventory < 15
+   */
+  private prioritizeRules(
+    applicableRules: { rule: PricingRule; shouldApply: boolean; reason: string }[]
+  ): { rule: PricingRule; shouldApply: boolean; reason: string }[] {
+    return applicableRules.sort((a, b) => {
+      const ruleA = a.rule;
+      const ruleB = b.rule;
+      
+      // Higher priority for more specific inventory conditions
+      if (ruleA.whenCondition === 'less_than_abs' && ruleB.whenCondition === 'less_than_abs') {
+        const valueA = parseFloat(ruleA.whenValue) || 0;
+        const valueB = parseFloat(ruleB.whenValue) || 0;
+        // Smaller threshold = higher priority (reverse sort)
+        return valueA - valueB;
+      }
+      
+      if (ruleA.whenCondition === 'more_than_abs' && ruleB.whenCondition === 'more_than_abs') {
+        const valueA = parseFloat(ruleA.whenValue) || 0;
+        const valueB = parseFloat(ruleB.whenValue) || 0;
+        // Larger threshold = higher priority
+        return valueB - valueA;
+      }
+      
+      // If different condition types, maintain original order
+      return 0;
+    });
+  }
+
+  /**
    * Update variant price based on applicable rules
    */
   private async updateVariantPrice(
     variant: any,
-    applicableRules: { rule: PricingRule; shouldApply: boolean; reason: string }[],
+    prioritizedRules: { rule: PricingRule; shouldApply: boolean; reason: string }[],
     campaign: any,
     webhookMessage: ShopifyWebhookMessage
   ): Promise<{ success: boolean; variantId: string; error?: string }> {
     try {
       const currentPrice = parseFloat(variant.price);
-      const rule = applicableRules[0].rule; // Use first applicable rule
+      const selectedRule = prioritizedRules[0]; // Use highest priority rule
+      const rule = selectedRule.rule;
+      
+      console.log(`🎯 Applying highest priority rule: ${rule.whenCondition} ${rule.whenValue} → ${rule.thenAction} ${rule.thenValue} (${selectedRule.reason})`);
       
       // Calculate new price
       const newPrice = this.calculateNewPrice(currentPrice, rule);
@@ -866,7 +1032,7 @@ export class CampaignProcessingService {
         newPrice: newPrice.toFixed(2),
         oldCompareAt: variant.compareAtPrice,
         newCompareAt: newCompareAt,
-        triggerReason: `Campaign triggered by ${webhookMessage.topic}: ${applicableRules[0].reason}`,
+        triggerReason: `Campaign triggered by ${webhookMessage.topic}: ${selectedRule.reason}`,
         webhookMessageId: webhookMessage.messageId,
         processingTimestamp: new Date()
       });
@@ -1014,6 +1180,34 @@ export class CampaignProcessingService {
         return true; // If shop not found, don't block processing
       }
 
+      // Check for existing lock first to avoid unnecessary create attempts
+      const existingLock = await prisma.processingLock.findUnique({
+        where: { lockKey }
+      });
+
+      if (existingLock) {
+        if (existingLock.expiresAt > new Date()) {
+          console.log(`⏳ Processing lock already held: ${lockKey} (expires: ${existingLock.expiresAt.toISOString()})`);
+          return false; // Lock is still valid, cannot acquire
+        } else {
+          // Lock expired, try to update it
+          try {
+            await prisma.processingLock.update({
+              where: { lockKey },
+              data: {
+                expiresAt,
+                processId: process.pid?.toString() || 'unknown'
+              }
+            });
+            console.log(`🔒 Updated expired processing lock: ${lockKey} (expires in ${timeoutSeconds}s)`);
+            return true;
+          } catch (updateError) {
+            console.log(`⏳ Failed to update expired lock, another process acquired it: ${lockKey}`);
+            return false;
+          }
+        }
+      }
+
       // Try to create a new lock
       const lock = await prisma.processingLock.create({
         data: {
@@ -1029,36 +1223,22 @@ export class CampaignProcessingService {
       return true;
 
     } catch (error) {
-      // If lock already exists, check if it's expired
+      // If lock creation fails due to race condition, check again
       if (error instanceof Error && error.message.includes('unique constraint')) {
+        console.log(`🔄 Lock creation race condition for: ${lockKey}, checking existing lock`);
+        
         const existingLock = await prisma.processingLock.findUnique({
           where: { lockKey }
         });
         
         if (existingLock && existingLock.expiresAt > new Date()) {
-          console.log(`⏳ Processing lock already held: ${lockKey}`);
-          return false; // Lock is still valid, cannot acquire
-        } else if (existingLock) {
-          // Lock expired, try to update it
-          try {
-            await prisma.processingLock.update({
-              where: { lockKey },
-              data: {
-                expiresAt: new Date(Date.now() + timeoutSeconds * 1000),
-                processId: process.pid?.toString() || 'unknown'
-              }
-            });
-            console.log(`🔒 Updated expired processing lock: ${lockKey}`);
-            return true;
-          } catch (updateError) {
-            console.log(`⏳ Failed to update expired lock, another process acquired it: ${lockKey}`);
-            return false;
-          }
+          console.log(`⏳ Confirmed lock already held by another process: ${lockKey}`);
+          return false; // Lock is valid, cannot acquire
         }
       }
       
       console.error('❌ Error acquiring processing lock:', error);
-      return true; // If error, don't block processing
+      return false; // Be more conservative - don't process if lock acquisition fails
     }
   }
 

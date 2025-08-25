@@ -72,9 +72,10 @@ export class CampaignService {
   async getCampaigns(filters: CampaignFilters): Promise<CampaignListResult> {
     const shopId = await this.getShopId();
 
-    // Build where clause
+    // Build where clause - exclude archived campaigns by default
     const where: any = {
-      shopifyShopId: shopId
+      shopifyShopId: shopId,
+      status: { not: 'ARCHIVED' } // Don't show archived campaigns in normal listing
     };
 
     if (filters.status) {
@@ -110,7 +111,10 @@ export class CampaignService {
       prisma.campaign.count({ where }),
       prisma.campaign.groupBy({
         by: ['status'],
-        where: { shopifyShopId: shopId },
+        where: { 
+          shopifyShopId: shopId,
+          status: { not: 'ARCHIVED' } // Exclude archived from counts too
+        },
         _count: true
       })
     ]);
@@ -172,6 +176,114 @@ export class CampaignService {
     });
 
     return campaign as CampaignWithRules | null;
+  }
+
+  /**
+   * Check for product overlaps with existing active campaigns
+   */
+  async checkProductOverlaps(input: CampaignInput, excludeCampaignId?: string): Promise<{
+    hasOverlaps: boolean;
+    overlappingProducts: Array<{
+      productId: string;
+      campaignId: string;
+      campaignName: string;
+      productTitle?: string;
+    }>;
+  }> {
+    const shopId = await this.getShopId();
+
+    // Get all active campaigns (excluding the one being updated if provided)
+    const where: any = {
+      shopifyShopId: shopId,
+      status: { in: ['ACTIVE'] } // Only check against active campaigns, paused ones don't conflict
+    };
+
+    if (excludeCampaignId) {
+      where.id = { not: excludeCampaignId };
+    }
+
+    const activeCampaigns = await prisma.campaign.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        targetProducts: true
+      }
+    });
+
+    const overlappingProducts: Array<{
+      productId: string;
+      campaignId: string;
+      campaignName: string;
+      productTitle?: string;
+    }> = [];
+
+    // Check for overlapping product IDs
+    const newProductIds = input.targetProducts.productIds || [];
+
+    for (const campaign of activeCampaigns) {
+      const existingTargetProducts = campaign.targetProducts as any;
+      const existingProductIds = existingTargetProducts?.productIds || [];
+
+      // Find overlapping product IDs
+      const overlapping = newProductIds.filter(id => existingProductIds.includes(id));
+      
+      overlapping.forEach(productId => {
+        overlappingProducts.push({
+          productId,
+          campaignId: campaign.id,
+          campaignName: campaign.name,
+          // TODO: Add product title lookup if needed
+        });
+      });
+    }
+
+    return {
+      hasOverlaps: overlappingProducts.length > 0,
+      overlappingProducts
+    };
+  }
+
+  /**
+   * Remove products from existing campaigns when moving to new campaign
+   */
+  async removeProductsFromCampaigns(productIds: string[], excludeCampaignId?: string): Promise<void> {
+    const shopId = await this.getShopId();
+
+    // Get campaigns that contain these products
+    const campaignsToUpdate = await prisma.campaign.findMany({
+      where: {
+        shopifyShopId: shopId,
+        status: { in: ['ACTIVE', 'PAUSED', 'DRAFT'] },
+        id: excludeCampaignId ? { not: excludeCampaignId } : undefined
+      },
+      select: {
+        id: true,
+        targetProducts: true
+      }
+    });
+
+    // Update each campaign by removing the conflicting products
+    for (const campaign of campaignsToUpdate) {
+      const existingTargetProducts = campaign.targetProducts as any;
+      const existingProductIds = existingTargetProducts?.productIds || [];
+      
+      // Remove overlapping products
+      const updatedProductIds = existingProductIds.filter((id: string) => !productIds.includes(id));
+      
+      // Only update if there are changes
+      if (updatedProductIds.length !== existingProductIds.length) {
+        await prisma.campaign.update({
+          where: { id: campaign.id },
+          data: {
+            targetProducts: {
+              ...existingTargetProducts,
+              productIds: updatedProductIds
+            }
+          }
+        });
+      }
+    }
   }
 
   /**
@@ -358,10 +470,10 @@ export class CampaignService {
    */
   private validateStatusTransition(currentStatus: CampaignStatus, newStatus: CampaignStatus): void {
     const validTransitions: Record<CampaignStatus, CampaignStatus[]> = {
-      DRAFT: ['ACTIVE'],
-      ACTIVE: ['PAUSED', 'COMPLETED'],
-      PAUSED: ['ACTIVE', 'COMPLETED'],
-      COMPLETED: [], // Terminal state
+      DRAFT: ['ACTIVE', 'ARCHIVED'],
+      ACTIVE: ['PAUSED', 'COMPLETED', 'ARCHIVED'],
+      PAUSED: ['ACTIVE', 'COMPLETED', 'ARCHIVED'],
+      COMPLETED: ['ARCHIVED'], // Can still be archived after completion
       ARCHIVED: [] // Terminal state
     };
 

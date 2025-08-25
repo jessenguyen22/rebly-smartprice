@@ -1,7 +1,7 @@
 import React from 'react';
 import { Badge, Tooltip } from '@shopify/polaris';
 
-export type CampaignStatus = 'DRAFT' | 'ACTIVE' | 'PAUSED' | 'COMPLETED';
+export type CampaignStatus = 'DRAFT' | 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'ARCHIVED';
 
 interface StatusIndicatorProps {
   status: CampaignStatus;
@@ -32,6 +32,11 @@ const statusConfig: Record<CampaignStatus, {
     tone: 'success',
     label: 'Completed',
     description: 'Campaign has finished execution'
+  },
+  ARCHIVED: {
+    tone: 'attention',
+    label: 'Archived',
+    description: 'Campaign has been deleted/archived'
   }
 };
 

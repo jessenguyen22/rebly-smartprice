@@ -16,10 +16,19 @@ import { ProductTargeting } from './ProductTargeting';
 import { CampaignPreview } from './CampaignPreview';
 
 interface CampaignFormProps {
-  onSubmit: (data: CreateCampaignData) => Promise<void>;
+  onSubmit: (data: CreateCampaignData, bypassOverlapCheck?: boolean) => Promise<void>;
   onCancel: () => void;
   initialData?: Partial<CreateCampaignData>;
   isSubmitting?: boolean;
+  overlapData?: {
+    overlaps: Array<{
+      productId: string;
+      campaignId: string;
+      campaignName: string;
+      productTitle?: string;
+    }>;
+    onBypassOverlap: (data: CreateCampaignData) => Promise<void>;
+  };
 }
 
 interface FormErrors {
@@ -34,7 +43,8 @@ export function CampaignForm({
   onSubmit, 
   onCancel, 
   initialData,
-  isSubmitting = false 
+  isSubmitting = false,
+  overlapData
 }: CampaignFormProps) {
   const [formData, setFormData] = useState<CreateCampaignData>({
     name: initialData?.name || '',
@@ -177,30 +187,66 @@ export function CampaignForm({
           error={errors.targetProducts}
         />
 
+        {overlapData && overlapData.overlaps.length > 0 && (
+          <Card>
+            <BlockStack gap="400">
+              <Text variant="headingMd" as="h3" tone="critical">
+                Product Overlap Warning
+              </Text>
+              <Text as="p">
+                The following products are already in other active campaigns:
+              </Text>
+              <BlockStack gap="200">
+                {overlapData.overlaps.map((overlap, index) => (
+                  <Text key={index} as="p" tone="subdued">
+                    • Product ID {overlap.productId} is in campaign "{overlap.campaignName}"
+                  </Text>
+                ))}
+              </BlockStack>
+              <Text as="p">
+                Do you want to move these products to this new campaign? This will remove them from their current campaigns.
+              </Text>
+              <ButtonGroup>
+                <Button
+                  variant="primary"
+                  tone="critical"
+                  onClick={() => overlapData.onBypassOverlap(formData)}
+                  disabled={isSubmitting}
+                >
+                  Move Products to New Campaign
+                </Button>
+                <Button onClick={onCancel}>Cancel</Button>
+              </ButtonGroup>
+            </BlockStack>
+          </Card>
+        )}
+
         {errors.general && (
           <Card>
             <InlineError message={errors.general} fieldID="campaign-form-general" />
           </Card>
         )}
 
-        <Card>
-          <ButtonGroup>
-            <Button
-              variant="primary"
-              onClick={handlePreviewToggle}
-              disabled={isSubmitting}
-              loading={false}
-            >
-              Preview Campaign
-            </Button>
-            <Button
-              onClick={onCancel}
-              disabled={isSubmitting}
-            >
-              Cancel
-            </Button>
-          </ButtonGroup>
-        </Card>
+        {!overlapData && (
+          <Card>
+            <ButtonGroup>
+              <Button
+                variant="primary"
+                onClick={handlePreviewToggle}
+                disabled={isSubmitting}
+                loading={false}
+              >
+                Preview Campaign
+              </Button>
+              <Button
+                onClick={onCancel}
+                disabled={isSubmitting}
+              >
+                Cancel
+              </Button>
+            </ButtonGroup>
+          </Card>
+        )}
       </FormLayout>
     </Form>
   );

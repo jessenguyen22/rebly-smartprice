@@ -18,7 +18,22 @@ const shopify = shopifyApp({
   distribution: AppDistribution.AppStore,
   future: {
     unstable_newEmbeddedAuthStrategy: true,
-    removeRest: true,
+  },
+  // Enhanced session management configuration
+  useOnlineTokens: true,
+  isEmbeddedApp: true,
+  hooks: {
+    afterAuth: async ({ session }) => {
+      console.log('🔐 Session established:', session.shop);
+      
+      // Register webhooks after authentication
+      try {
+        await registerWebhooks({ session });
+        console.log('📡 Webhooks registered successfully for:', session.shop);
+      } catch (error) {
+        console.error('❌ Failed to register webhooks:', error);
+      }
+    },
   },
   ...(process.env.SHOP_CUSTOM_DOMAIN
     ? { customShopDomains: [process.env.SHOP_CUSTOM_DOMAIN] }

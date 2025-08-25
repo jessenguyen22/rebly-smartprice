@@ -26,41 +26,45 @@ model Session {
 }
 
 model ShopifyShop {
-  id                  String               @id @default(uuid()) @db.Uuid
-  shopDomain          String               @unique
+  id                  String                @id @default(uuid()) @db.Uuid
+  shopDomain          String                @unique
   accessToken         String?
   scopes              String?
   country             String?
   currency            String?
   timezone            String?
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
+  createdAt           DateTime              @default(now())
+  updatedAt           DateTime              @updatedAt
   auditTrailEntries   AuditTrailEntry[]
   campaigns           Campaign[]
   pricingJobTemplates PricingJobTemplate[]
   pricingJobs         PricingJob[]
+  ruleExecutionStates RuleExecutionState[]
+  variantStateHistory VariantStateHistory[]
   webhookLogs         WebhookLog[]
-  priceCooldowns      PriceCooldown[]
   processingLocks     ProcessingLock[]
+  priceCooldowns      PriceCooldown[]
 
   @@map("shopify_shops")
 }
 
 model Campaign {
-  id             String         @id @default(uuid()) @db.Uuid
-  name           String
-  description    String?
-  status         CampaignStatus @default(DRAFT)
-  targetProducts Json
-  priority       Int            @default(1)
-  triggerCount   Int            @default(0)
-  lastTriggered  DateTime?
-  userId         String?
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
-  shopifyShopId  String         @db.Uuid
-  shopifyShop    ShopifyShop    @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
-  rules          PricingRule[]
+  id              String               @id @default(uuid()) @db.Uuid
+  name            String
+  description     String?
+  status          CampaignStatus       @default(DRAFT)
+  targetProducts  Json
+  priority        Int                  @default(1)
+  triggerCount    Int                  @default(0)
+  lastTriggered   DateTime?
+  userId          String?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  shopifyShopId   String               @db.Uuid
+  shopifyShop     ShopifyShop          @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+  rules           PricingRule[]
+  executionStates RuleExecutionState[]
+  priceCooldowns  PriceCooldown[]
 
   @@index([shopifyShopId, status])
   @@index([shopifyShopId, lastTriggered])
@@ -68,7 +72,7 @@ model Campaign {
 }
 
 model PricingRule {
-  id              String      @id @default(uuid()) @db.Uuid
+  id              String               @id @default(uuid()) @db.Uuid
   description     String?
   whenCondition   String
   whenOperator    String
@@ -76,13 +80,15 @@ model PricingRule {
   thenAction      String
   thenMode        String
   thenValue       String
-  changeCompareAt Boolean     @default(false)
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
-  campaignId      String?     @db.Uuid
-  pricingJobId    String?     @db.Uuid
-  campaign        Campaign?   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  pricingJob      PricingJob? @relation(fields: [pricingJobId], references: [id], onDelete: Cascade)
+  changeCompareAt Boolean              @default(false)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+  campaignId      String?              @db.Uuid
+  pricingJobId    String?              @db.Uuid
+  campaign        Campaign?            @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  pricingJob      PricingJob?          @relation(fields: [pricingJobId], references: [id], onDelete: Cascade)
+  executionStates RuleExecutionState[]
+  thresholdConfig RuleThresholdConfig?
 
   @@index([campaignId])
   @@index([pricingJobId])
@@ -221,38 +227,68 @@ model WebhookLog {
   @@map("webhook_logs")
 }
 
-model PriceCooldown {
-  id          String      @id @default(uuid()) @db.Uuid
-  variantId   String
-  campaignId  String?
-  type        CooldownType @default(PRICE_UPDATE)
-  expiresAt   DateTime
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
-  shopifyShopId String    @db.Uuid
-  shopifyShop   ShopifyShop @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+model RuleExecutionState {
+  id                 String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ruleId             String                    @db.Uuid
+  variantId          String
+  campaignId         String                    @db.Uuid
+  state              public_RuleExecutionState @default(INACTIVE)
+  lastTriggerValue   Decimal?                  @db.Decimal(10, 2)
+  lastInventoryValue Int?
+  thresholdDirection ThresholdDirection?
+  triggeredAt        DateTime?
+  cooldownUntil      DateTime?
+  resetConditionMet  Boolean                   @default(false)
+  triggerCount       Int                       @default(0)
+  metadata           Json?
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @default(now()) @updatedAt
+  shopifyShopId      String                    @db.Uuid
+  campaign           Campaign                  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  rule               PricingRule               @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  shopifyShop        ShopifyShop               @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
 
-  @@unique([variantId, type])
-  @@index([variantId, expiresAt])
-  @@index([shopifyShopId])
-  @@index([expiresAt])
-  @@map("price_cooldowns")
+  @@unique([variantId, ruleId], map: "rule_execution_states_variant_rule_unique")
+  @@index([campaignId, state], map: "rule_execution_states_campaign_state_idx")
+  @@index([variantId, ruleId], map: "rule_execution_states_variant_rule_idx")
+  @@map("rule_execution_states")
 }
 
-model ProcessingLock {
-  id          String              @id @default(uuid()) @db.Uuid
-  lockKey     String              @unique // webhook_<messageId> or campaign_<campaignId>_<variantId>
-  type        ProcessingLockType
-  expiresAt   DateTime
-  processId   String?             // Optional process identifier
-  createdAt   DateTime            @default(now())
-  shopifyShopId String            @db.Uuid
-  shopifyShop   ShopifyShop       @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+model VariantStateHistory {
+  id                String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  variantId         String
+  productId         String
+  inventoryQuantity Int
+  priceAmount       Decimal     @db.Decimal(10, 2)
+  compareAtPrice    Decimal?    @db.Decimal(10, 2)
+  inventoryChange   Int         @default(0)
+  priceChange       Decimal     @default(0) @db.Decimal(10, 2)
+  changeReason      String?
+  capturedAt        DateTime    @default(now())
+  shopifyShopId     String      @db.Uuid
+  shopifyShop       ShopifyShop @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
 
-  @@index([lockKey, expiresAt])
-  @@index([shopifyShopId])
-  @@index([expiresAt])
-  @@map("processing_locks")
+  @@index([shopifyShopId, capturedAt], map: "variant_state_history_shop_time_idx")
+  @@index([variantId, capturedAt], map: "variant_state_history_variant_time_idx")
+  @@map("variant_state_history")
+}
+
+model RuleThresholdConfig {
+  id                     String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  ruleId                 String      @unique(map: "rule_threshold_configs_rule_unique") @db.Uuid
+  triggerThreshold       Decimal     @db.Decimal(10, 2)
+  triggerOperator        String
+  resetThreshold         Decimal?    @db.Decimal(10, 2)
+  resetOperator          String?
+  minimumCooldownMinutes Int         @default(60)
+  requiresResetCondition Boolean     @default(true)
+  maxTriggersPerDay      Int?        @default(5)
+  createdAt              DateTime    @default(now())
+  updatedAt              DateTime    @default(now()) @updatedAt
+  rule                   PricingRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([ruleId], map: "rule_threshold_configs_rule_idx")
+  @@map("rule_threshold_configs")
 }
 
 enum CampaignStatus {
@@ -267,7 +303,6 @@ enum PricingJobType {
   MANUAL
   CAMPAIGN
   WEBHOOK_SYNC
-  ROLLBACK
 }
 
 enum JobStatus {
@@ -276,7 +311,6 @@ enum JobStatus {
   COMPLETED
   FAILED
   CANCELLED
-  IN_PROGRESS
 }
 
 enum WebhookStatus {
@@ -286,12 +320,47 @@ enum WebhookStatus {
   RETRYING
 }
 
-enum CooldownType {
-  PRICE_UPDATE
-  CAMPAIGN_TRIGGER
+enum ThresholdDirection {
+  ABOVE
+  BELOW
+  CROSSING_UP
+  CROSSING_DOWN
 }
 
-enum ProcessingLockType {
-  WEBHOOK_PROCESSING
-  CAMPAIGN_EXECUTION
+enum public_RuleExecutionState {
+  INACTIVE
+  TRIGGERED
+  COOLING_DOWN
+  RESET_PENDING
+
+  @@map("RuleExecutionState")
+}
+
+model ProcessingLock {
+  id            String      @id @default(uuid()) @db.Uuid
+  lockKey       String      @unique
+  type          String      // 'WEBHOOK_PROCESSING' | 'CAMPAIGN_EXECUTION'
+  expiresAt     DateTime
+  processId     String?
+  createdAt     DateTime    @default(now())
+  shopifyShopId String      @db.Uuid
+  shopifyShop   ShopifyShop @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+
+  @@map("processing_locks")
+}
+
+model PriceCooldown {
+  id            String      @id @default(uuid()) @db.Uuid
+  variantId     String
+  campaignId    String?     @db.Uuid
+  type          String      // 'PRICE_UPDATE' | 'CAMPAIGN_TRIGGER'
+  expiresAt     DateTime
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  shopifyShopId String      @db.Uuid
+  shopifyShop   ShopifyShop @relation(fields: [shopifyShopId], references: [id], onDelete: Cascade)
+  campaign      Campaign?   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([variantId, type])
+  @@map("price_cooldowns")
 }

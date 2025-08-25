@@ -214,7 +214,7 @@ export function CampaignCard({
               </Button>
             ))}
             
-            {onDelete && campaign.status === 'DRAFT' && (
+            {onDelete && campaign.status !== 'ARCHIVED' && (
               <Button 
                 onClick={() => onDelete(campaign.id)}
                 variant="secondary"

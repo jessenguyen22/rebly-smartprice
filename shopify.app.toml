@@ -2,7 +2,7 @@
 
 client_id = "4dca9babd033b9aeb856acaa17935bd1"
 name = "rebly-smartprice"
-application_url = "https://day-para-condition-eq.trycloudflare.com"
+application_url = "https://checked-join-und-grade.trycloudflare.com"
 embedded = true
 handle = "rebly-smartprice"
 
@@ -37,7 +37,7 @@ api_version = "2025-07"
 scopes = "write_products,read_products,read_inventory,write_inventory"
 
 [auth]
-redirect_urls = ["https://day-para-condition-eq.trycloudflare.com/auth/callback", "https://day-para-condition-eq.trycloudflare.com/auth/shopify/callback", "https://day-para-condition-eq.trycloudflare.com/api/auth/callback"]
+redirect_urls = ["https://checked-join-und-grade.trycloudflare.com/auth/callback", "https://checked-join-und-grade.trycloudflare.com/auth/shopify/callback", "https://checked-join-und-grade.trycloudflare.com/api/auth/callback"]
 
 [pos]
 embedded = false

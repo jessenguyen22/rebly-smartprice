@@ -62,7 +62,8 @@ export async function action({ request, params }: ActionFunctionArgs) {
         await campaignService.updateCampaignStatus(params.id, 'PAUSED');
         break;
       case 'delete':
-        await campaignService.deleteCampaign(params.id);
+        // Use soft delete (archive) instead of hard delete to support all campaign statuses
+        await campaignService.updateCampaignStatus(params.id, 'ARCHIVED');
         return redirect('/app/campaigns');
       default:
         throw new Error('Invalid action');
